@@ -1,0 +1,203 @@
+---
+title: "Prediction Assignment Writeup - Practical ML course"
+author: "toshi1979"
+date: "5/12/2020"
+output: html_document
+---
+## Synopsis
+The goal of this project is to predict the "classe" with reasonable accuracy by using any of the other variables. First some data cleansisng and preprosessing was conducted. Secondory a model performance bench mark was conductted in between two candidates - random forest and gradint boosting, to select the better model within targeted accuracy. As a result, the random forest model was chosen. Final of all, the classfication result predicted by the final model will be tested in 20 diffrent test case. 
+
+### Back ground
+Using devices such as Jawbone Up, Nike FuelBand, and Fitbit it is now possible to collect a large amount of data about personal activity relatively inexpensively. These type of devices are part of the quantified self movement – a group of enthusiasts who take measurements about themselves regularly to improve their health, to find patterns in their behavior, or because they are tech geeks. One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it. In this project, your goal will be to use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants. They were asked to perform barbell lifts correctly and incorrectly in 5 different ways. More information is available from the website here: http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har (see the section on the Weight Lifting Exercise Dataset).
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, message=FALSE, results='hide', warning=FALSE}
+# environment set up
+library(VIM)
+library(caret)
+library(parallel)
+library(doParallel)
+
+set.seed(123)
+```
+## Loading data set
+Load csv files for test and train data set with handling missing value.
+```{r loadData, cache = TRUE}
+org_trainSet <- read.csv("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv",
+                         na.strings = c("NA","","#DIV/0!"))
+org_testSet <- read.csv("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv",
+                        na.strings = c("NA","","#DIV/0!"))
+```
+
+## Pre processing
+First, visualize the pattern of missing value then make a decision how to deal with it.
+```{r visualize missing value,cache = TRUE}
+# explore pattern of missing values
+aggr(org_testSet , prop=FALSE, number=TRUE)
+aggr(org_trainSet, prop=FALSE, number=TRUE)
+```
+  
+As you can see, the pattern of missing value is similar with both test and train data set.  
+Common columns which have missing value can be dropped.  
+
+```{r treat_missingvalue, cache = TRUE}
+# find columns that have all NA rows in test set.
+naCols <- colSums(is.na(org_testSet)) == nrow(org_testSet)
+# see how many complete NA columns in test set
+table(naCols)
+
+# excluding complete NA columns
+testSet <- org_testSet[,!naCols]
+trainSet <- org_trainSet[,!naCols]
+```
+
+Now the dimension of train and test data set after cleaning missing value is as below respectively.
+```{r}
+dim(trainSet)
+dim(testSet)
+```
+
+Prepare test and train data set using caret::createDataPartition() function.
+Create two partitions,75 % and 25 % within the original training dataset.
+
+```{r preProcessing, cache = TRUE}
+inTraining <- createDataPartition(y=trainSet$classe, p=0.75, list=FALSE)
+trainingSet <- trainSet[inTraining, ] 
+testingSet <- trainSet[-inTraining, ]
+```
+
+```{r, include=FALSE} 
+# just for note. it can be useful in case only one level of factor exist
+
+# use only complete case
+tdata <- trainSet[complete.cases(trainSet),]
+
+# remove factor columns which only have one level.
+keep <- function (x) {
+    if (is.factor(x)) {
+        length(unique(x[!is.na(x)])) > 1
+    } else TRUE
+}
+
+tdata <- tdata[sapply(tdata, keep)]
+
+# also nearZeroVar in caret is helpful
+nearZeroVar(trainSet,saveMetrics = TRUE)
+```
+
+## Modeling
+Since accuracy is the most critical issue in this classification study[1], two modeling approaches, Random forest and Gradiant boosting are considered.
+
+### Random forest model
+Due to slowness of processing time of random forest, I did take parallel processing and k-fold cross-validation. [2]  
+
+1: Configure parallel processing  
+Parallel processing in caret can be accomplished with the parallel and doParallel packages.
+```{r parallelism for RF model}
+cluster <- makeCluster(detectCores() - 1) # convention to leave 1 core for OS
+registerDoParallel(cluster)
+```
+2: Configure trainControl object  
+The most critical arguments for the trainControl function are the resampling method, the number that specifies the quantity of folds for k-fold cross-validation, and allowParallel which tells caret to use the cluster that we've registered in the previous step.
+
+```{r traincontrol}
+fitControl <- trainControl(method = "cv",
+                           number = 5,
+                           allowParallel = TRUE)
+```
+
+3: Develop training model  
+```{r Random_forest_model,cache = TRUE}
+t<-proc.time()
+model_rf <- train(classe~. - X,data=trainingSet,method="rf", trControl = fitControl)
+# processing time to develop a model
+rfTime <- (proc.time()-t)
+```
+
+```{r, include=FALSE}
+# processing time can be extract using like this
+model_rf$times
+```
+
+4: De-register parallel processing cluster  
+After processing the data, we explicitly shut down the cluster by calling the stopCluster() and registerDoSEQ() functions. The registerDoSEQ() function is required to force R to return to single threaded processing.
+
+```{r postprocess}
+stopCluster(cluster)
+registerDoSEQ()
+```
+
+#### Prediction and performance evaluation
+Fit a model just created above to test data set and evaluate its performance.
+```{r predict}
+pred_rf <- predict(model_rf,newdata = testingSet)
+result_rf <- confusionMatrix(pred_rf, testingSet$classe)
+result_rf
+```
+- Accuracy is `r result_rf$overall[1]`  
+- Elapsed time is `r rfTime[3]`  
+
+```{r,include=FALSE}
+# importance
+plot(varImp(model_rf),top=20)
+```
+
+### Gradient boosting model
+
+As default resampling condition of gbm was also very slow, I set same condition with RF that is k-ford cross validation.  
+```{r gbm,cache = TRUE}
+# gbm is faster than RF but a little bit worse accuracy with this data set.
+t<-proc.time()
+model_gbm <- train(classe~. - X,data=trainingSet,method="gbm", trControl = fitControl , verbose = FALSE)
+gbmTime <- (proc.time()-t)
+
+# prediction and evaluate the accuracy
+pred_gbm <- predict(model_gbm,newdata = testingSet)
+result_gbm <- confusionMatrix(pred_gbm, testingSet$classe)
+result_gbm
+```
+- Accuracy is `r result_gbm$overall[1]`  
+- Elapsed time is `r gbmTime[3]`  
+
+```{r DT, include=FALSE,cache = TRUE}
+# following code are not included in report.
+# just trying decision tree as a first step of modeling
+t<-proc.time()
+model_rpart <- train(classe~. - X,data=trainingSet,method="rpart")
+print(proc.time()-t)
+
+# plot tree with fancy plot
+library("rattle")
+fancyRpartPlot(model_rpart$finalModel)
+
+# prediction and evaluate the accuracy
+pred_rpart <- predict(model_rpart,newdata = testingSet)
+confusionMatrix(pred_rpart, testingSet$classe)
+```
+
+## Conclusion
+The random forest with k-ford cross validation approach is the most accurate one that satisfy accuracy criteria while it was slower.
+```{r, echo=FALSE, message=FALSE, warning=FALSE,results = "asis"}
+library(stargazer)
+data <- data.frame(Model= c("Random forest","Gradient boosting"),
+                   Accuracy=c(result_rf$overall[1],result_gbm$overall[1]),
+                   Speed=c(rfTime[3],gbmTime[3]))
+stargazer(data, type = "html",summary=FALSE, rownames = FALSE, title = "bench mark result")
+```
+  
+    
+Therefore final prediction on original test set is as shown below.  
+```{r predict on testSet}
+predict(model_rf,newdata = testSet)
+```
+
+References:  
+[1] Required Model Accuracy for Course project,
+https://github.com/lgreski/datasciencectacontent/blob/master/markdown/pml-requiredModelAccuracy.md  
+[2] Improving Performance of Random Forest in caret,  
+https://github.com/lgreski/datasciencectacontent/blob/master/markdown/pml-randomForestPerformance.md    
+
